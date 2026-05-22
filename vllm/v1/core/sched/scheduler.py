@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -168,6 +169,32 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # Tail-aware scheduling experiment. This is intentionally gated by env
+        # vars so default vLLM behavior is unchanged unless explicitly enabled.
+        self.tail_aware_enabled = self._env_bool("VLLM_TAIL_AWARE_SCHEDULING")
+        self.tail_aware_short_threshold = int(
+            os.environ.get("VLLM_TAIL_AWARE_SHORT_THRESHOLD", "64")
+        )
+        self.tail_aware_long_quota = float(
+            os.environ.get("VLLM_TAIL_AWARE_LONG_QUOTA", "0.2")
+        )
+        self.tail_aware_long_req_ids: set[str] = set()
+        self.tail_aware_eos_window = int(
+            os.environ.get("VLLM_TAIL_AWARE_EOS_WINDOW", "16")
+        )
+        self.tail_aware_eos_thresh = float(
+            os.environ.get("VLLM_TAIL_AWARE_EOS_THRESH", "0.05")
+        )
+        if self.tail_aware_enabled:
+            logger.info(
+                "Tail-aware scheduling enabled: short_threshold=%d, "
+                "long_quota=%.2f, eos_window=%d, eos_thresh=%.4f",
+                self.tail_aware_short_threshold,
+                self.tail_aware_long_quota,
+                self.tail_aware_eos_window,
+                self.tail_aware_eos_thresh,
+            )
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -383,6 +410,9 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        if self.tail_aware_enabled:
+            self._reorder_running_for_tail_aware()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -1347,6 +1377,11 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
+
+            if model_runner_output.eos_probs is not None:
+                request.recent_eos_probs.append(
+                    model_runner_output.eos_probs[req_index])
+
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
@@ -1635,6 +1670,7 @@ class Scheduler(SchedulerInterface):
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
+            self._maybe_demote_tail_aware_request(request)
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:
@@ -1747,6 +1783,71 @@ class Scheduler(SchedulerInterface):
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
+    @staticmethod
+    def _env_bool(name: str) -> bool:
+        return os.environ.get(name, "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _maybe_demote_tail_aware_request(self, request: Request) -> None:
+        if not self.tail_aware_enabled:
+            return
+        request_id = request.request_id
+        if request_id in self.tail_aware_long_req_ids:
+            return
+        if request.num_output_tokens < self.tail_aware_short_threshold:
+            return
+        if request.recent_eos_probs:
+            window = request.recent_eos_probs[-self.tail_aware_eos_window:]
+            if max(window) > self.tail_aware_eos_thresh:
+                return
+        self.tail_aware_long_req_ids.add(request_id)
+        logger.debug(
+            "Tail-aware scheduler demoted request %s after %d output tokens.",
+            request_id,
+            request.num_output_tokens,
+        )
+
+    def _reorder_running_for_tail_aware(self) -> None:
+        if not self.tail_aware_long_req_ids or len(self.running) <= 1:
+            return
+        probation_or_short: list[Request] = []
+        long_reqs: list[Request] = []
+        for request in self.running:
+            if request.request_id in self.tail_aware_long_req_ids:
+                long_reqs.append(request)
+            else:
+                probation_or_short.append(request)
+        if not probation_or_short or not long_reqs:
+            self.running = probation_or_short + long_reqs
+            return
+
+        # Approximate a long-queue quota at request ordering granularity.
+        # With the default 0.2 quota, schedule about 4 probation/short requests
+        # per 1 demoted long request. vLLM's token budget is still enforced by
+        # the existing scheduler loop.
+        if self.tail_aware_long_quota <= 0:
+            self.running = probation_or_short + long_reqs
+            return
+        high_per_long = max(
+            1,
+            int((1.0 - self.tail_aware_long_quota) / self.tail_aware_long_quota),
+        )
+        reordered: list[Request] = []
+        high_idx = 0
+        long_idx = 0
+        while high_idx < len(probation_or_short) or long_idx < len(long_reqs):
+            high_end = min(high_idx + high_per_long, len(probation_or_short))
+            reordered.extend(probation_or_short[high_idx:high_end])
+            high_idx = high_end
+            if long_idx < len(long_reqs):
+                reordered.append(long_reqs[long_idx])
+                long_idx += 1
+        self.running = reordered
+
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
     ) -> list[tuple[str, int]]:
@@ -1830,6 +1931,7 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        self.tail_aware_long_req_ids.discard(request.request_id)
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 

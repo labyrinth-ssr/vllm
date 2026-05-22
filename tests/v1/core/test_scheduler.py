@@ -4288,3 +4288,113 @@ def test_eagle3_mm_encoder_cache_with_shift():
         f"shifted_end={scheduled_end_with_shift}) overlapping MM at "
         f"{start_pos}. The fix must schedule encoder inputs."
     )
+
+
+def test_tail_aware_token_demotion_threshold(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SHORT_THRESHOLD", "3")
+
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1, max_tokens=8)[0]
+
+    scheduler._update_request_with_output(request, [100, 101])
+    assert request.request_id not in scheduler.tail_aware_long_req_ids
+
+    scheduler._update_request_with_output(request, [102])
+    assert request.request_id in scheduler.tail_aware_long_req_ids
+
+    scheduler._update_request_with_output(request, [103])
+    assert scheduler.tail_aware_long_req_ids == {request.request_id}
+
+
+def test_tail_aware_reorder_running_with_long_quota(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_LONG_QUOTA", "0.25")
+
+    scheduler = create_scheduler()
+    requests = create_requests(
+        num_requests=6,
+        req_ids=["short0", "long0", "short1", "short2", "long1", "short3"],
+    )
+    scheduler.running = requests.copy()
+    scheduler.tail_aware_long_req_ids = {"long0", "long1"}
+
+    scheduler._reorder_running_for_tail_aware()
+
+    assert [request.request_id for request in scheduler.running] == [
+        "short0",
+        "short1",
+        "short2",
+        "long0",
+        "short3",
+        "long1",
+    ]
+
+
+def test_tail_aware_cleanup_on_free_blocks(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+    scheduler.tail_aware_long_req_ids.add(request.request_id)
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id not in scheduler.tail_aware_long_req_ids
+
+
+def test_tail_aware_eos_prevents_demotion(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SHORT_THRESHOLD", "3")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_EOS_THRESH", "0.05")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_EOS_WINDOW", "4")
+
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1, max_tokens=16)[0]
+
+    scheduler._update_request_with_output(request, [100, 101, 102])
+    request.recent_eos_probs = [0.01, 0.02, 0.10]
+    scheduler._maybe_demote_tail_aware_request(request)
+    assert request.request_id not in scheduler.tail_aware_long_req_ids
+
+
+def test_tail_aware_eos_low_allows_demotion(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SHORT_THRESHOLD", "3")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_EOS_THRESH", "0.05")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_EOS_WINDOW", "4")
+
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1, max_tokens=16)[0]
+
+    scheduler._update_request_with_output(request, [100, 101, 102])
+    request.recent_eos_probs = [0.01, 0.02, 0.03]
+    scheduler._maybe_demote_tail_aware_request(request)
+    assert request.request_id in scheduler.tail_aware_long_req_ids
+
+
+def test_tail_aware_eos_window_sliding(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SHORT_THRESHOLD", "3")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_EOS_THRESH", "0.05")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_EOS_WINDOW", "2")
+
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1, max_tokens=16)[0]
+
+    scheduler._update_request_with_output(request, [100, 101, 102])
+    request.recent_eos_probs = [0.10, 0.01, 0.01]
+    scheduler._maybe_demote_tail_aware_request(request)
+    assert request.request_id in scheduler.tail_aware_long_req_ids
+
+
+def test_tail_aware_eos_prob_stored_on_request(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+
+    request = create_requests(num_requests=1, max_tokens=16)[0]
+    assert request.recent_eos_probs == []
+    request.recent_eos_probs.append(0.05)
+    request.recent_eos_probs.append(0.10)
+    assert request.recent_eos_probs == [0.05, 0.10]

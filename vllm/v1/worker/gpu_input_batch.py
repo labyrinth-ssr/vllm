@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
+import os
 from dataclasses import dataclass
 from typing import cast
 
@@ -122,6 +123,11 @@ class InputBatch:
         self.device = device
         self.pin_memory = pin_memory
         self.vocab_size = vocab_size
+
+        self.tail_aware_enabled = os.environ.get(
+            "VLLM_TAIL_AWARE_SCHEDULING", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._eos_token_id: int | None = None
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -378,6 +384,9 @@ class InputBatch:
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
+            if self._eos_token_id is None and sampling_params._eos_token_id is not None:
+                self._eos_token_id = sampling_params._eos_token_id
+
             if sampling_params.sampling_type == SamplingType.GREEDY:
                 # Should avoid division by zero later when apply_temperature.
                 self.temperature_cpu[req_index] = 0.0
@@ -930,6 +939,17 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
+            eos_token_ids=self._build_eos_token_ids_tensor(num_reqs),
+        )
+
+    def _build_eos_token_ids_tensor(
+        self, num_reqs: int
+    ) -> torch.Tensor | None:
+        if not self.tail_aware_enabled or self._eos_token_id is None:
+            return None
+        return torch.full(
+            (num_reqs,), self._eos_token_id,
+            dtype=torch.int64, device=self.device,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

@@ -90,6 +90,9 @@ class Sampler(nn.Module):
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
 
+        eos_probs = self._compute_eos_probs(
+            logits, sampling_metadata.eos_token_ids)
+
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
         )
@@ -139,6 +142,7 @@ class Sampler(nn.Module):
             # token per request.
             sampled_token_ids=sampled.unsqueeze(-1),
             logprobs_tensors=logprobs_tensors,
+            eos_probs=eos_probs,
         )
         return sampler_output
 
@@ -290,6 +294,17 @@ class Sampler(nn.Module):
     @staticmethod
     def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
         return logits.log_softmax(dim=-1, dtype=torch.float32)
+
+    @staticmethod
+    def _compute_eos_probs(
+        logits: torch.Tensor,
+        eos_token_ids: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if eos_token_ids is None:
+            return None
+        eos_logits = logits.gather(-1, eos_token_ids.unsqueeze(-1))
+        log_Z = logits.logsumexp(dim=-1, keepdim=True)
+        return (eos_logits - log_Z).exp().squeeze(-1)
 
     @staticmethod
     def gather_logprobs(
