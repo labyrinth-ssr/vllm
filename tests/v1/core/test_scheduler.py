@@ -4354,9 +4354,9 @@ def test_tail_aware_eos_prevents_demotion(monkeypatch):
     scheduler = create_scheduler()
     request = create_requests(num_requests=1, max_tokens=16)[0]
 
-    scheduler._update_request_with_output(request, [100, 101, 102])
+    scheduler._update_request_with_output(request, [100, 101])
     request.recent_eos_probs = [0.01, 0.02, 0.10]
-    scheduler._maybe_demote_tail_aware_request(request)
+    scheduler._update_request_with_output(request, [102])
     assert request.request_id not in scheduler.tail_aware_long_req_ids
 
 
@@ -4369,9 +4369,9 @@ def test_tail_aware_eos_low_allows_demotion(monkeypatch):
     scheduler = create_scheduler()
     request = create_requests(num_requests=1, max_tokens=16)[0]
 
-    scheduler._update_request_with_output(request, [100, 101, 102])
+    scheduler._update_request_with_output(request, [100, 101])
     request.recent_eos_probs = [0.01, 0.02, 0.03]
-    scheduler._maybe_demote_tail_aware_request(request)
+    scheduler._update_request_with_output(request, [102])
     assert request.request_id in scheduler.tail_aware_long_req_ids
 
 
@@ -4384,9 +4384,9 @@ def test_tail_aware_eos_window_sliding(monkeypatch):
     scheduler = create_scheduler()
     request = create_requests(num_requests=1, max_tokens=16)[0]
 
-    scheduler._update_request_with_output(request, [100, 101, 102])
+    scheduler._update_request_with_output(request, [100, 101])
     request.recent_eos_probs = [0.10, 0.01, 0.01]
-    scheduler._maybe_demote_tail_aware_request(request)
+    scheduler._update_request_with_output(request, [102])
     assert request.request_id in scheduler.tail_aware_long_req_ids
 
 
