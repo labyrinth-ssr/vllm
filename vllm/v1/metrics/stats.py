@@ -197,6 +197,13 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # Tail-aware scheduler experiment stats. These stay at their zero/default
+    # values unless VLLM_TAIL_AWARE_SCHEDULING is enabled.
+    tail_aware_demotion_count: int = 0
+    tail_aware_demotion_output_tokens: list[int] = field(default_factory=list)
+    tail_aware_scheduled_high_reqs: int = 0
+    tail_aware_scheduled_long_reqs: int = 0
+
 
 @dataclass
 class RequestStateStats:

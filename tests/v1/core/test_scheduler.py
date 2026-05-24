@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -4398,3 +4399,65 @@ def test_tail_aware_eos_prob_stored_on_request(monkeypatch):
     request.recent_eos_probs.append(0.05)
     request.recent_eos_probs.append(0.10)
     assert request.recent_eos_probs == [0.05, 0.10]
+
+
+def test_tail_aware_demotion_metrics_and_log(monkeypatch, tmp_path):
+    log_path = tmp_path / "tail_aware.jsonl"
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SHORT_THRESHOLD", "3")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_LOG_PATH", str(log_path))
+
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1, max_tokens=8)[0]
+
+    scheduler._update_request_with_output(request, [100, 101, 102])
+
+    assert scheduler.tail_aware_demotion_count == 1
+    assert scheduler.tail_aware_demotion_output_tokens == [3]
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.tail_aware_demotion_count == 1
+    assert stats.tail_aware_demotion_output_tokens == [3]
+
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[0]["event"] == "demotion"
+    assert events[0]["request_id"] == request.request_id
+    assert events[0]["output_tokens"] == 3
+
+
+def test_tail_aware_schedule_step_metrics_and_log(monkeypatch, tmp_path):
+    log_path = tmp_path / "tail_aware.jsonl"
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_LOG_PATH", str(log_path))
+
+    scheduler = create_scheduler()
+    scheduler.tail_aware_long_req_ids = {"long"}
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {
+        "short": 1,
+        "long": 1,
+    }
+
+    scheduler._record_tail_aware_schedule_metrics(scheduler_output, 1.25)
+
+    assert scheduler.tail_aware_scheduled_high_reqs == 1
+    assert scheduler.tail_aware_scheduled_long_reqs == 1
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.tail_aware_scheduled_high_reqs == 1
+    assert stats.tail_aware_scheduled_long_reqs == 1
+
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[0]["event"] == "schedule_step"
+    assert events[0]["scheduled_high_reqs"] == 1
+    assert events[0]["scheduled_long_reqs"] == 1
+    assert events[0]["request_queue_classes"] == {
+        "short": "high",
+        "long": "long",
+    }

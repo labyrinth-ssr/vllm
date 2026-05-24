@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
 import os
 import time
 from collections import defaultdict, deque
@@ -186,6 +187,12 @@ class Scheduler(SchedulerInterface):
         self.tail_aware_eos_thresh = float(
             os.environ.get("VLLM_TAIL_AWARE_EOS_THRESH", "0.05")
         )
+        self.tail_aware_demotion_count = 0
+        self.tail_aware_demotion_output_tokens: list[int] = []
+        self.tail_aware_scheduled_high_reqs = 0
+        self.tail_aware_scheduled_long_reqs = 0
+        self.tail_aware_step = 0
+        self.tail_aware_log_path = os.environ.get("VLLM_TAIL_AWARE_LOG_PATH")
         if self.tail_aware_enabled:
             logger.info(
                 "Tail-aware scheduling enabled: short_threshold=%d, "
@@ -954,6 +961,11 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
+
+        if self.tail_aware_enabled:
+            self._record_tail_aware_schedule_metrics(
+                scheduler_output, scheduled_timestamp
+            )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1805,10 +1817,27 @@ class Scheduler(SchedulerInterface):
             if max(window) > self.tail_aware_eos_thresh:
                 return
         self.tail_aware_long_req_ids.add(request_id)
+        self.tail_aware_demotion_count += 1
+        self.tail_aware_demotion_output_tokens.append(request.num_output_tokens)
         logger.debug(
             "Tail-aware scheduler demoted request %s after %d output tokens.",
             request_id,
             request.num_output_tokens,
+        )
+        self._write_tail_aware_log(
+            {
+                "event": "demotion",
+                "request_id": request_id,
+                "output_tokens": request.num_output_tokens,
+                "recent_eos_max": max(
+                    request.recent_eos_probs[-self.tail_aware_eos_window:]
+                )
+                if request.recent_eos_probs
+                else None,
+                "threshold": self.tail_aware_short_threshold,
+                "eos_window": self.tail_aware_eos_window,
+                "eos_thresh": self.tail_aware_eos_thresh,
+            }
         )
 
     def _reorder_running_for_tail_aware(self) -> None:
@@ -1847,6 +1876,45 @@ class Scheduler(SchedulerInterface):
                 reordered.append(long_reqs[long_idx])
                 long_idx += 1
         self.running = reordered
+
+    def _tail_aware_queue_class(self, request_id: str) -> str:
+        return "long" if request_id in self.tail_aware_long_req_ids else "high"
+
+    def _record_tail_aware_schedule_metrics(
+        self,
+        scheduler_output: SchedulerOutput,
+        scheduled_timestamp: float,
+    ) -> None:
+        self.tail_aware_step += 1
+        scheduled_classes = {
+            req_id: self._tail_aware_queue_class(req_id)
+            for req_id in scheduler_output.num_scheduled_tokens
+        }
+        high_count = sum(1 for cls in scheduled_classes.values() if cls == "high")
+        long_count = sum(1 for cls in scheduled_classes.values() if cls == "long")
+        self.tail_aware_scheduled_high_reqs += high_count
+        self.tail_aware_scheduled_long_reqs += long_count
+        if not scheduled_classes:
+            return
+        self._write_tail_aware_log(
+            {
+                "event": "schedule_step",
+                "step": self.tail_aware_step,
+                "timestamp": scheduled_timestamp,
+                "scheduled_high_reqs": high_count,
+                "scheduled_long_reqs": long_count,
+                "num_scheduled_tokens": scheduler_output.num_scheduled_tokens,
+                "request_queue_classes": scheduled_classes,
+            }
+        )
+
+    def _write_tail_aware_log(self, payload: dict[str, Any]) -> None:
+        if not self.tail_aware_log_path:
+            return
+        payload = {"time": time.time(), **payload}
+        os.makedirs(os.path.dirname(self.tail_aware_log_path) or ".", exist_ok=True)
+        with open(self.tail_aware_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, sort_keys=True) + "\n")
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2061,6 +2129,12 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            tail_aware_demotion_count=self.tail_aware_demotion_count,
+            tail_aware_demotion_output_tokens=(
+                self.tail_aware_demotion_output_tokens.copy()
+            ),
+            tail_aware_scheduled_high_reqs=self.tail_aware_scheduled_high_reqs,
+            tail_aware_scheduled_long_reqs=self.tail_aware_scheduled_long_reqs,
         )
 
     def make_spec_decoding_stats(
