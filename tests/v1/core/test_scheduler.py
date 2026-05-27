@@ -4461,3 +4461,44 @@ def test_tail_aware_schedule_step_metrics_and_log(monkeypatch, tmp_path):
         "short": "high",
         "long": "long",
     }
+
+
+def test_tail_aware_waiting_prefers_high_over_long(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+
+    scheduler = create_scheduler()
+    long_req, high_req = create_requests(
+        num_requests=2,
+        req_ids=["long", "high"],
+    )
+    scheduler.waiting.add_request(long_req)
+    scheduler.waiting.add_request(high_req)
+    scheduler.tail_aware_long_req_ids = {"long"}
+
+    request_queue = scheduler._select_waiting_queue_for_scheduling()
+
+    assert request_queue is scheduler.waiting
+    assert scheduler.waiting.peek_request().request_id == "high"
+
+
+def test_tail_aware_preempts_long_for_high_waiter(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+
+    scheduler = create_scheduler(max_num_seqs=1, max_num_batched_tokens=64)
+    long_req, high_req = create_requests(
+        num_requests=2,
+        req_ids=["long", "high"],
+    )
+    scheduler.add_request(long_req)
+    scheduler.schedule()
+    assert [request.request_id for request in scheduler.running] == ["long"]
+
+    scheduler.tail_aware_long_req_ids = {"long"}
+    scheduler.add_request(high_req)
+    output = scheduler.schedule()
+
+    assert [request.request_id for request in scheduler.running] == ["high"]
+    assert output.preempted_req_ids == {"long"}
+    assert long_req.status == RequestStatus.PREEMPTED
+    assert long_req.request_id in scheduler.tail_aware_long_req_ids
+    assert [request.request_id for request in scheduler.waiting] == ["long"]

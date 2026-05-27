@@ -418,7 +418,11 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        tail_aware_preempted_reqs: list[Request] = []
         if self.tail_aware_enabled:
+            tail_aware_preempted_reqs = (
+                self._preempt_tail_aware_long_for_high_waiter(scheduled_timestamp)
+            )
             self._reorder_running_for_tail_aware()
 
         # First, schedule the RUNNING requests.
@@ -961,6 +965,11 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
+        if tail_aware_preempted_reqs:
+            scheduler_output.preempted_req_ids = {
+                *(scheduler_output.preempted_req_ids or set()),
+                *(req.request_id for req in tail_aware_preempted_reqs),
+            }
 
         if self.tail_aware_enabled:
             self._record_tail_aware_schedule_metrics(
@@ -1612,6 +1621,17 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
+        if self.tail_aware_enabled:
+            # Prefer high/probation waiting requests over preempted long
+            # requests. This approximates the two waiting queues from the
+            # design without replacing vLLM's request-queue implementation.
+            if self.waiting and self._promote_tail_aware_high_waiter(self.waiting):
+                return self.waiting
+            if self.skipped_waiting and self._promote_tail_aware_high_waiter(
+                self.skipped_waiting
+            ):
+                return self.skipped_waiting
+
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
 
@@ -1879,6 +1899,43 @@ class Scheduler(SchedulerInterface):
 
     def _tail_aware_queue_class(self, request_id: str) -> str:
         return "long" if request_id in self.tail_aware_long_req_ids else "high"
+
+    def _promote_tail_aware_high_waiter(self, queue: RequestQueue) -> bool:
+        for request in queue:
+            if request.request_id in self.tail_aware_long_req_ids:
+                continue
+            if request is not queue.peek_request():
+                queue.remove_request(request)
+                queue.prepend_request(request)
+            return True
+        return False
+
+    def _has_tail_aware_high_waiter(self) -> bool:
+        return any(
+            request.request_id not in self.tail_aware_long_req_ids
+            for request in self.waiting
+        )
+
+    def _preempt_tail_aware_long_for_high_waiter(
+        self,
+        scheduled_timestamp: float,
+    ) -> list[Request]:
+        if len(self.running) < self.max_num_running_reqs:
+            return []
+        if not self.tail_aware_long_req_ids or not self._has_tail_aware_high_waiter():
+            return []
+
+        for request in reversed(self.running):
+            if request.request_id in self.tail_aware_long_req_ids:
+                self.running.remove(request)
+                self._preempt_request(request, scheduled_timestamp)
+                logger.debug(
+                    "Tail-aware scheduler preempted long request %s "
+                    "to admit a high-priority waiter.",
+                    request.request_id,
+                )
+                return [request]
+        return []
 
     def _record_tail_aware_schedule_metrics(
         self,
