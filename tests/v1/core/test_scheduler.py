@@ -4483,6 +4483,7 @@ def test_tail_aware_waiting_prefers_high_over_long(monkeypatch):
 
 def test_tail_aware_preempts_long_for_high_waiter(monkeypatch):
     monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_PREEMPTION", "1")
 
     scheduler = create_scheduler(max_num_seqs=1, max_num_batched_tokens=64)
     long_req, high_req = create_requests(
@@ -4502,3 +4503,71 @@ def test_tail_aware_preempts_long_for_high_waiter(monkeypatch):
     assert long_req.status == RequestStatus.PREEMPTED
     assert long_req.request_id in scheduler.tail_aware_long_req_ids
     assert [request.request_id for request in scheduler.waiting] == ["long"]
+    assert scheduler.tail_aware_preempt_counts["long"] == 1
+
+
+def test_tail_aware_preemption_disabled_by_default(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.delenv("VLLM_TAIL_AWARE_PREEMPTION", raising=False)
+
+    scheduler = create_scheduler(max_num_seqs=1, max_num_batched_tokens=64)
+    long_req, high_req = create_requests(
+        num_requests=2,
+        req_ids=["long", "high"],
+    )
+    scheduler.add_request(long_req)
+    scheduler.schedule()
+
+    scheduler.tail_aware_long_req_ids = {"long"}
+    scheduler.add_request(high_req)
+    output = scheduler.schedule()
+
+    assert [request.request_id for request in scheduler.running] == ["long"]
+    assert output.preempted_req_ids == set()
+    assert high_req.status == RequestStatus.WAITING
+    assert scheduler.waiting.peek_request().request_id == "high"
+
+
+def test_tail_aware_preemption_respects_per_request_cap(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_PREEMPTION", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_MAX_PREEMPTS_PER_REQ", "1")
+
+    scheduler = create_scheduler(max_num_seqs=1, max_num_batched_tokens=64)
+    long_req, high_req = create_requests(
+        num_requests=2,
+        req_ids=["long", "high"],
+    )
+    scheduler.add_request(long_req)
+    scheduler.schedule()
+
+    scheduler.tail_aware_long_req_ids = {"long"}
+    scheduler.tail_aware_preempt_counts = {"long": 1}
+    scheduler.add_request(high_req)
+    output = scheduler.schedule()
+
+    assert [request.request_id for request in scheduler.running] == ["long"]
+    assert output.preempted_req_ids == set()
+    assert scheduler.waiting.peek_request().request_id == "high"
+
+
+def test_tail_aware_preemption_respects_long_quota(monkeypatch):
+    monkeypatch.setenv("VLLM_TAIL_AWARE_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_PREEMPTION", "1")
+    monkeypatch.setenv("VLLM_TAIL_AWARE_LONG_QUOTA", "1.0")
+
+    scheduler = create_scheduler(max_num_seqs=1, max_num_batched_tokens=64)
+    long_req, high_req = create_requests(
+        num_requests=2,
+        req_ids=["long", "high"],
+    )
+    scheduler.add_request(long_req)
+    scheduler.schedule()
+
+    scheduler.tail_aware_long_req_ids = {"long"}
+    scheduler.add_request(high_req)
+    output = scheduler.schedule()
+
+    assert [request.request_id for request in scheduler.running] == ["long"]
+    assert output.preempted_req_ids == set()
+    assert scheduler.waiting.peek_request().request_id == "high"

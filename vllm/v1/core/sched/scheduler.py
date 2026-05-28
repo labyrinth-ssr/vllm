@@ -187,6 +187,13 @@ class Scheduler(SchedulerInterface):
         self.tail_aware_eos_thresh = float(
             os.environ.get("VLLM_TAIL_AWARE_EOS_THRESH", "0.05")
         )
+        self.tail_aware_preemption_enabled = self._env_bool(
+            "VLLM_TAIL_AWARE_PREEMPTION"
+        )
+        self.tail_aware_max_preempts_per_req = int(
+            os.environ.get("VLLM_TAIL_AWARE_MAX_PREEMPTS_PER_REQ", "1")
+        )
+        self.tail_aware_preempt_counts: dict[str, int] = {}
         self.tail_aware_demotion_count = 0
         self.tail_aware_demotion_output_tokens: list[int] = []
         self.tail_aware_scheduled_high_reqs = 0
@@ -196,11 +203,14 @@ class Scheduler(SchedulerInterface):
         if self.tail_aware_enabled:
             logger.info(
                 "Tail-aware scheduling enabled: short_threshold=%d, "
-                "long_quota=%.2f, eos_window=%d, eos_thresh=%.4f",
+                "long_quota=%.2f, eos_window=%d, eos_thresh=%.4f, "
+                "preemption=%s, max_preempts_per_req=%d",
                 self.tail_aware_short_threshold,
                 self.tail_aware_long_quota,
                 self.tail_aware_eos_window,
                 self.tail_aware_eos_thresh,
+                self.tail_aware_preemption_enabled,
+                self.tail_aware_max_preempts_per_req,
             )
 
         # The request IDs that are finished in between the previous and the
@@ -420,9 +430,12 @@ class Scheduler(SchedulerInterface):
 
         tail_aware_preempted_reqs: list[Request] = []
         if self.tail_aware_enabled:
-            tail_aware_preempted_reqs = (
-                self._preempt_tail_aware_long_for_high_waiter(scheduled_timestamp)
-            )
+            if self.tail_aware_preemption_enabled:
+                tail_aware_preempted_reqs = (
+                    self._preempt_tail_aware_long_for_high_waiter(
+                        scheduled_timestamp
+                    )
+                )
             self._reorder_running_for_tail_aware()
 
         # First, schedule the RUNNING requests.
@@ -1916,6 +1929,15 @@ class Scheduler(SchedulerInterface):
             for request in self.waiting
         )
 
+    def _tail_aware_running_long_ratio(self) -> float:
+        if not self.running:
+            return 0.0
+        long_count = sum(
+            request.request_id in self.tail_aware_long_req_ids
+            for request in self.running
+        )
+        return long_count / len(self.running)
+
     def _preempt_tail_aware_long_for_high_waiter(
         self,
         scheduled_timestamp: float,
@@ -1924,17 +1946,29 @@ class Scheduler(SchedulerInterface):
             return []
         if not self.tail_aware_long_req_ids or not self._has_tail_aware_high_waiter():
             return []
+        if self._tail_aware_running_long_ratio() <= self.tail_aware_long_quota:
+            return []
 
         for request in reversed(self.running):
-            if request.request_id in self.tail_aware_long_req_ids:
-                self.running.remove(request)
-                self._preempt_request(request, scheduled_timestamp)
-                logger.debug(
-                    "Tail-aware scheduler preempted long request %s "
-                    "to admit a high-priority waiter.",
-                    request.request_id,
-                )
-                return [request]
+            request_id = request.request_id
+            if request_id not in self.tail_aware_long_req_ids:
+                continue
+            if (
+                self.tail_aware_preempt_counts.get(request_id, 0)
+                >= self.tail_aware_max_preempts_per_req
+            ):
+                continue
+            self.running.remove(request)
+            self.tail_aware_preempt_counts[request_id] = (
+                self.tail_aware_preempt_counts.get(request_id, 0) + 1
+            )
+            self._preempt_request(request, scheduled_timestamp)
+            logger.debug(
+                "Tail-aware scheduler preempted long request %s "
+                "to admit a high-priority waiter.",
+                request_id,
+            )
+            return [request]
         return []
 
     def _record_tail_aware_schedule_metrics(
@@ -2057,6 +2091,7 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self.tail_aware_long_req_ids.discard(request.request_id)
+        self.tail_aware_preempt_counts.pop(request.request_id, None)
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
